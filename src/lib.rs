@@ -1,63 +1,49 @@
-use std::{time::{Instant}, sync::{Arc, Mutex, Condvar, MutexGuard}, thread::JoinHandle, collections::HashMap};
+use std::{time::{Instant, Duration}, sync::{Arc, Mutex, Condvar, MutexGuard}, thread::JoinHandle, collections::HashMap};
 
-use schedule::Schedule;
 use tracing::{info, warn, info_span, debug_span, debug};
 
-/// Defines the [Schedule](crate::schedule::Schedule) trait and various implementations.
-pub mod schedule {
-    use std::{time::{Instant, Duration}};
+/// A [Schedule] implementation controls when jobs are executed. All that the [JobRunner]
+/// does is invoke a job in an infinite loop (until the [JobRunner] is shut down), with
+/// a delay between runs. The delay is controlled by the [Schedule], and schedules can specify
+/// either fixed or varying delays.
+pub trait Schedule : Send + 'static {
+    /// Returns when the next job execution should occur at.
+    fn next_start_time(&mut self, latest_start_time: Instant, latest_end_time: Instant) -> Instant;
+}
 
-    pub trait Schedule : Send + 'static {
-        fn next_start_time(&mut self, latest_start_time: Instant, latest_end_time: Instant) -> Option<Instant>;
+impl<T> Schedule for T where T : FnMut(Instant, Instant) -> Instant + Send + 'static {
+    fn next_start_time(&mut self, latest_start_time: Instant, latest_end_time: Instant) -> Instant {
+        self(latest_start_time, latest_end_time)
     }
-    
-    impl<T> Schedule for T where T : FnMut(Instant, Instant) -> Option<Instant> + Send + 'static {
-        fn next_start_time(&mut self, latest_start_time: Instant, latest_end_time: Instant) -> Option<Instant> {
-            self(latest_start_time, latest_end_time)
-        }
-    }
-    
-    /// Returns a [Schedule] which executes the job once.
-    pub fn once() -> impl Schedule {
-        let mut executed = false;
-        move |_, _| {
-            if executed {
-                None
-            } else {
-                executed = true;
-                Some(Instant::now())
-            }
-        }
-    }
+}
 
-    /// Returns a [Schedule] which runs the job constantly, as fast as possible.
-    pub fn always() -> impl Schedule {
-        |_, _| Some(Instant::now())
-    }
+/// Returns a [Schedule] which runs the job constantly, as fast as possible.
+pub fn always() -> impl Schedule {
+    |_, _| Instant::now()
+}
 
-    /// Returns a [Schedule] which inserts a fixed delay between the end of one job
-    /// execution and the start of the next. Note that this means that how often jobs
-    /// execute depends on how long jobs take to run.
-    pub fn fixed_delay(delay: Duration) -> impl Schedule {
-        move |_, _| Some(Instant::now() + delay)
-    }
+/// Returns a [Schedule] which inserts a fixed delay between the end of one job
+/// execution and the start of the next. Note that this means that how often jobs
+/// execute depends on how long jobs take to run.
+pub fn fixed_delay(delay: Duration) -> impl Schedule {
+    move |_, _| Instant::now() + delay
+}
 
-    /// Returns a [Schedule] which runs jobs on a cron schedule. If a job execution
-    /// runs overlong, then the executions which were overlapped will simply be skipped.
-    /// For example, if a job is scheduled to run every second, but takes 5 seconds to run,
-    /// then the 4 executions that should have happened while the slow job was executing
-    /// will be skipped - only every 5th scheduled job will actually execute.
-    #[cfg(feature = "cron")]
-    pub fn cron(schedule: &str) -> Result<impl Schedule, ::cron::error::Error> {
-        use std::str::FromStr;
-        let schedule = ::cron::Schedule::from_str(schedule)?;
-        Ok(move |_, _| {
-            schedule.upcoming(chrono::Utc).next().and_then(|when| {
-                let duration = when - chrono::Utc::now();
-                Some(Instant::now() + duration.to_std().ok()?)
-            })
-        })
-    }
+/// Returns a [Schedule] which runs jobs on a cron schedule. If a job execution
+/// runs overlong, then the executions which were overlapped will simply be skipped.
+/// For example, if a job is scheduled to run every second, but takes 5 seconds to run,
+/// then the 4 executions that should have happened while the slow job was executing
+/// will be skipped - only every 5th scheduled job will actually execute.
+#[cfg(feature = "cron")]
+pub fn cron(schedule: &str) -> Result<impl Schedule, ::cron::error::Error> {
+    use std::str::FromStr;
+    let schedule = ::cron::Schedule::from_str(schedule)?;
+    Ok(move |_, _| {
+        schedule.upcoming(chrono::Utc).next().and_then(|when| {
+            let duration = when - chrono::Utc::now();
+            Some(Instant::now() + duration.to_std().ok()?)
+        }).unwrap_or(Instant::now())
+    })
 }
 
 /// A description of a job that can be registered with a [JobRunner].
@@ -91,13 +77,18 @@ impl Job {
 }
 
 /// The main coordinator for running jobs. It exposes methods to start and stop jobs,
-/// as well as to get
+/// as well as to get the status of a job or all jobs.
+/// 
+/// Each job added to the [JobRunner] is given a dedicated thread to execute on, therefore
+/// the number of threads created by the [JobRunner] is equal to the number of jobs
+/// which are [started](JobRunner::start).
 pub struct JobRunner {
     join_on_drop: bool,
     jobs: HashMap<String, JobHandle>,
 }
 
 impl JobRunner {
+    /// Initialize a new [JobRunner] with no jobs started yet.
     pub fn new() -> Self {
         Self {
             join_on_drop: false,
@@ -105,6 +96,11 @@ impl JobRunner {
         }
     }
 
+    /// Allows you to configure the [JobRunner] to wait for job threads to exit
+    /// when [dropped](Drop::drop). The default value for this option is `false`,
+    /// which is equivalent to calling the [stop_all](JobRunner::stop_all) method
+    /// at drop time. Passing `true` for this option is equivalent to calling the
+    /// [join_all](JobRunner::join_all) method at drop time.
     pub fn join_on_drop(&mut self, join_on_drop: bool) -> &mut Self {
         self.join_on_drop = join_on_drop;
         self
@@ -117,7 +113,9 @@ impl JobRunner {
         })
     }
 
-    pub fn statuses<'this>(&'this self) -> impl Iterator<Item = (&'this String, JobStatus)> + 'this {
+    /// Gets an iterator over all job statuses. The iterator item tuple's first entry
+    /// is the name of the job.
+    pub fn statuses(&self) -> impl Iterator<Item = (&String, JobStatus)> {
         self.jobs.iter().flat_map(|(name, handle)| {
             let status = match handle.status.lock() {
                 Ok(status) => status,
@@ -127,6 +125,9 @@ impl JobRunner {
         })
     }
 
+    /// Registers a job and starts it executing on a dedicated thread. The job schedule's
+    /// [Schedule::next_start_time] method will be called to determine when the
+    /// first job execution should occur.
     #[tracing::instrument(skip_all)]
     pub fn start(&mut self, job: Job) -> std::io::Result<()> {
         let status = Arc::new(Mutex::new(JobStatus::default()));
@@ -144,11 +145,15 @@ impl JobRunner {
                 run_job(name, job.schedule, job.logic, status, shutdown)
             }
         })?;
-        self.jobs.insert(job.name, JobHandle {
+        let prev_handle = self.jobs.insert(job.name, JobHandle {
             status,
             shutdown,
             join_handle,
         });
+        if let Some(handle) = prev_handle {
+            *handle.shutdown.0.lock().unwrap() = true;
+            let _ = handle.join_handle.join();
+        }
         Ok(())
     }
 
@@ -204,7 +209,11 @@ impl JobRunner {
 
 impl Drop for JobRunner {
     fn drop(&mut self) {
-        self.join_all();
+        if self.join_on_drop {
+            self.join_all();
+        } else {
+            self.stop_all();
+        }
     }
 }
 
@@ -230,8 +239,11 @@ pub struct JobStatus {
     /// has never executed yet, or has not finished executing for the first time.
     pub latest_end_time: Option<Instant>,
     /// The time at which the currently running execution started. This will be [None]
-    /// whenever the job is not running.
+    /// whenever the job is not executing.
     pub current_start_time: Option<Instant>,
+    /// When the next job execution is scheduled for. This will be [None] when the job
+    /// is executing.
+    pub next_start_time: Option<Instant>,
 }
 
 fn run_job(
@@ -244,18 +256,26 @@ fn run_job(
     let mut latest_start_time = Instant::now();
     let mut latest_end_time = latest_start_time;
     loop {
-        let schedule_result = {
+        let next_start_time = {
             let _span = debug_span!("job_schedule");
             info!("Invoking job schedule");
             schedule.next_start_time(latest_start_time, latest_end_time)
         };
-        let next_start_time = match schedule_result {
-            Some(t) => t,
-            None => {
-                info!("Job exiting run loop because schedule returned None for next start time");
-                break;
-            }
+
+        // Update the JobStatus for the next start time.
+        {
+            let _span = debug_span!("job_next_start_status_update");
+            debug!("Updating job status for next start time schedule");
+            let mut status = match status.lock() {
+                Ok(status) => status,
+                Err(_) => {
+                    warn!("Job exiting run loop due to poison error when locking status for next start time update");
+                    break;
+                }
+            };
+            status.next_start_time = Some(next_start_time);
         };
+        
         let is_shutdown = {
             let _span = debug_span!("job_sleep");
             sleep_until(next_start_time, &shutdown)
@@ -280,6 +300,7 @@ fn run_job(
             status.runs += 1;
             status.running = true;
             status.current_start_time = Some(now);
+            status.next_start_time = None;
             now
         };
 
