@@ -1,5 +1,37 @@
 //! A simple [JobRunner] which gives each job a dedicated thread and allows for 
 //! configurable delays between each invocation of the job's logic.
+//! 
+//! # Example
+//! 
+//! A program using the [JobRunner] is expected to have this basic outline:
+//! 
+//! ```rust
+//! use job_runner::{Job, JobRunner, fixed_delay};
+//! 
+//! fn main() {
+//!     // At program startup, create the JobRunner and register your tasks.
+//!     let mut job_runner = JobRunner::new();
+//!     job_runner.start(Job::new(
+//!         "cool_job",
+//!         fixed_delay(std::time::Duration::from_secs(5)),
+//!         my_cool_job));
+//! 
+//!     // Do other things in your program...
+//! 
+//!     // Then, when shutting down your program, signal all the job threads
+//!     // to stop running.
+//!     job_runner.stop_all();
+//! 
+//!     // Maybe signal other parts of your program to gracefully shut down too...
+//! 
+//!     // Finally (and optionally) wait for the job threads to actually exit.
+//!     job_runner.join_all();
+//! }
+//! 
+//! fn my_cool_job() {
+//!     // Do cool things..
+//! }
+//! ```
 
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(missing_docs)]
@@ -14,26 +46,28 @@ use tracing::{info, warn, info_span, debug_span, debug};
 /// a delay between runs. The delay is controlled by the [Schedule], and schedules can specify
 /// either fixed or varying delays.
 pub trait Schedule : Send + 'static {
-    /// Returns when the next job execution should occur at.
-    fn next_start_time(&mut self) -> Instant;
+    /// Returns when the next job execution should occur at. Typical implementations of this
+    /// method will choose the next delay by looking at the current time using mechanisms such
+    /// as [Instant::now()](std::time::Instant::now).
+    fn next_start_delay(&mut self) -> Duration;
 }
 
-impl<T> Schedule for T where T : FnMut() -> Instant + Send + 'static {
-    fn next_start_time(&mut self) -> Instant {
+impl<T> Schedule for T where T : FnMut() -> Duration + Send + 'static {
+    fn next_start_delay(&mut self) -> Duration {
         self()
     }
 }
 
 /// Returns a [Schedule] which runs the job constantly, as fast as possible.
 pub fn spin() -> impl Schedule {
-    || Instant::now()
+    || Duration::ZERO
 }
 
 /// Returns a [Schedule] which inserts a fixed delay between the end of one job
 /// execution and the start of the next. Note that this means that how often jobs
 /// execute depends on how long jobs take to run.
 pub fn fixed_delay(delay: Duration) -> impl Schedule {
-    move || Instant::now() + delay
+    move || delay
 }
 
 /// Returns a [Schedule] which runs jobs on a cron schedule. If a job execution
@@ -47,9 +81,8 @@ pub fn cron(schedule: &str) -> Result<impl Schedule, ::cron::error::Error> {
     let schedule = ::cron::Schedule::from_str(schedule)?;
     Ok(move || {
         schedule.upcoming(chrono::Utc).next().and_then(|when| {
-            let duration = when - chrono::Utc::now();
-            Some(Instant::now() + duration.to_std().ok()?)
-        }).unwrap_or(Instant::now())
+            when.signed_duration_since(chrono::Utc::now()).to_std().ok()
+        }).unwrap_or(Duration::ZERO)
     })
 }
 
@@ -133,7 +166,7 @@ impl JobRunner {
     }
 
     /// Registers a job and starts it executing on a dedicated thread. The job schedule's
-    /// [Schedule::next_start_time] method will be called to determine when the
+    /// [Schedule::next_start_delay] method will be called to determine when the
     /// first job execution should occur.
     #[tracing::instrument(skip_all)]
     pub fn start(&mut self, job: Job) -> std::io::Result<()> {
@@ -264,7 +297,7 @@ fn run_job(
         let next_start_time = {
             let _span = debug_span!("job_schedule");
             info!("Invoking job schedule");
-            schedule.next_start_time()
+            Instant::now() + schedule.next_start_delay()
         };
 
         // Update the JobStatus for the next start time.
