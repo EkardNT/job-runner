@@ -1,15 +1,20 @@
 [package]
-name = "job_runner"
+name = "job-runner"
 version = "0.1.0"
 edition = "2021"
+license = "CC0-1.0"
+description = "Simple background job runner with configurable delays between job runs"
+homepage = "https://crates.io/crates/job-runner"
+repository = "https://github.com/EkardNT/job-runner"
+keywords = ["job", "task", "cron"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 chrono = { version = "0.4.23", optional = true, default-features = false}
 cron = { version = "0.12.0", optional = true }
-tracing = "0.1.37"
+tracing = { version = "0.1.37", optional = true }
 
 [features]
-# default = ["cron"]
 cron = ["dep:cron", "chrono"]
+tracing = ["dep:tracing"]

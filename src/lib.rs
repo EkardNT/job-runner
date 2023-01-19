@@ -39,7 +39,8 @@
 
 use std::{time::{Instant, Duration}, sync::{Arc, Mutex, Condvar}, thread::JoinHandle, collections::HashMap};
 
-use tracing::{info, warn, info_span, debug_span, debug};
+#[cfg(feature = "tracing")]
+use tracing::{info, warn, info_span};
 
 /// A [Schedule] implementation controls when jobs are executed. All that the [JobRunner]
 /// does is invoke a job in an infinite loop (until the [JobRunner] is shut down), with
@@ -139,6 +140,7 @@ impl Default for JobRunner {
 
 impl JobRunner {
     /// Initialize a new [JobRunner] with no jobs started yet.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub fn new() -> Self {
         Self {
             join_on_drop: false,
@@ -151,12 +153,14 @@ impl JobRunner {
     /// which is equivalent to calling the [stop_all](JobRunner::stop_all) method
     /// at drop time. Passing `true` for this option is equivalent to calling the
     /// [join_all](JobRunner::join_all) method at drop time.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub fn join_on_drop(&mut self, join_on_drop: bool) -> &mut Self {
         self.join_on_drop = join_on_drop;
         self
     }
 
     /// Gets the latest status of a specific job by the job's name.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub fn status(&self, job_name: &str) -> Option<JobStatus> {
         self.jobs.get(job_name).and_then(|handle| {
             Some(handle.status.lock().ok()?.clone())
@@ -165,6 +169,7 @@ impl JobRunner {
 
     /// Gets an iterator over all job statuses. The iterator item tuple's first entry
     /// is the name of the job.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub fn statuses(&self) -> impl Iterator<Item = (&String, JobStatus)> {
         self.jobs.iter().flat_map(|(name, handle)| {
             let status = match handle.status.lock() {
@@ -189,10 +194,12 @@ impl JobRunner {
     /// job will immediately begin executing after the current run finishes, but after that
     /// follow up run finishes then the job will go back to its normal schedule (assuming no
     /// other `request_execution` calls have arrived in the mean time).
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub fn request_execution(&self, job_name: &str) {
         let handle = match self.jobs.get(job_name) {
             Some(h) => h,
             None => {
+                #[cfg(feature = "tracing")]
                 info!("No job named {} is currently registered", job_name);
                 return;
             }
@@ -201,6 +208,7 @@ impl JobRunner {
             let mut guard = match handle.shutdown.0.lock() {
                 Ok(g) => g,
                 Err(_) => {
+                    #[cfg(feature = "tracing")]
                     warn!("Unable to request execution of job {} because poisoned shutdown mutex lock encountered", job_name);
                     return;
                 }
@@ -213,7 +221,7 @@ impl JobRunner {
     /// Registers a job and starts it executing on a dedicated thread. The job schedule's
     /// [Schedule::next_start_delay] method will be called to determine when the
     /// first job execution should occur.
-    #[tracing::instrument(skip_all)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub fn start(&mut self, job: Job) -> std::io::Result<()> {
         let status = Arc::new(Mutex::new(JobStatus::default()));
         let shutdown = Arc::new((Mutex::new((false, 0)), Condvar::new()));
@@ -249,17 +257,21 @@ impl JobRunner {
     /// down, if you have other parts of the program that you want to begin shutting down
     /// too before calling the blocking [join_all](JobRunner::join_all) method. This method
     /// signals, but does not block.
-    #[tracing::instrument(skip_all)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub fn stop_all(&mut self) {
+        #[cfg(feature = "tracing")]
         info!("Signaling {} jobs to stop", self.jobs.len());
         for (name, handle) in &mut self.jobs {
+            #[cfg(feature = "tracing")]
             let _span = info_span!("stop_job", job = name);
             if let Ok(mut guard) = handle.shutdown.0.lock() {
                 if !guard.0 {
+                    #[cfg(feature = "tracing")]
                     info!("Signaled job to shut down");
                     guard.0 = true;
                 }
             } else {
+                #[cfg(feature = "tracing")]
                 warn!("Received poison error when trying to acquire shutdown signal lock");
             }
         }
@@ -274,17 +286,21 @@ impl JobRunner {
     /// to finish its run. If you have particularly long-running jobs, you may want
     /// to pass them a separate cancellation token that you call before invoking this
     /// method.
-    #[tracing::instrument(skip_all)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub fn join_all(&mut self) {
         self.stop_all();
+        #[cfg(feature = "tracing")]
         info!("Joining {} jobs", self.jobs.len());
         for (name, handle) in self.jobs.drain() {
+            #[cfg(feature = "tracing")]
             let _span = info_span!("join_job", job = name);
             match handle.join_handle.join() {
                 Ok(()) => {
+                    #[cfg(feature = "tracing")]
                     info!("Job thread exited normally");
                 },
                 Err(_) => {
+                    #[cfg(feature = "tracing")]
                     warn!("Job thread exited with a panic");
                 }
             }
@@ -337,21 +353,27 @@ fn run_job(
         mut logic: Box<dyn FnMut()>,
         status: Arc<Mutex<JobStatus>>,
         shutdown: Arc<(Mutex<(bool, usize)>, Condvar)>) {
+    #[cfg(feature = "tracing")]
     let _fn_span = tracing::info_span!("run_job", job = name);
     loop {
         let next_start_time = {
-            let _span = debug_span!("job_schedule");
+            #[cfg(feature = "tracing")]
+            let _span = info_span!("job_schedule");
+            #[cfg(feature = "tracing")]
             info!("Invoking job schedule");
             Instant::now() + schedule.next_start_delay()
         };
 
         // Update the JobStatus for the next start time.
         {
-            let _span = debug_span!("job_next_start_status_update");
-            debug!("Updating job status for next start time schedule");
+            #[cfg(feature = "tracing")]
+            let _span = info_span!("job_next_start_status_update");
+            #[cfg(feature = "tracing")]
+            info!("Updating job status for next start time schedule");
             let mut status = match status.lock() {
                 Ok(status) => status,
                 Err(_) => {
+                    #[cfg(feature = "tracing")]
                     warn!("Job exiting run loop due to poison error when locking status for next start time update");
                     break;
                 }
@@ -360,22 +382,27 @@ fn run_job(
         };
         
         let sleep_result = {
-            let _span = debug_span!("job_sleep");
+            #[cfg(feature = "tracing")]
+            let _span = info_span!("job_sleep");
             sleep_until(next_start_time, &shutdown)
         };
         if sleep_result.should_exit_job() {
+            #[cfg(feature = "tracing")]
             info!("Job run loop will exit due to sleep result {:?}", sleep_result);
             break;
         }
         
         // Update the JobStatus for the start of the current run.
         let latest_start_time = {
-            let _span = debug_span!("job_start_status_update");
-            debug!("Updating job status for start of current run");
+            #[cfg(feature = "tracing")]
+            let _span = info_span!("job_start_status_update");
+            #[cfg(feature = "tracing")]
+            info!("Updating job status for start of current run");
             let now = Instant::now();
             let mut status = match status.lock() {
                 Ok(status) => status,
                 Err(_) => {
+                    #[cfg(feature = "tracing")]
                     warn!("Job exiting run loop due to poison error when locking status for start of job execution");
                     break;
                 }
@@ -389,19 +416,24 @@ fn run_job(
 
         // Invoke the logic.
         {
-            let _span = debug_span!("job_logic");
+            #[cfg(feature = "tracing")]
+            let _span = info_span!("job_logic");
+            #[cfg(feature = "tracing")]
             info!("Invoking job logic");
             logic();
         }
 
         // Update the JobStatus for the end of the current run.
         {
-            let _span = debug_span!("job_end_status_update");
-            debug!("Updating job status for end of current run");
+            #[cfg(feature = "tracing")]
+            let _span = info_span!("job_end_status_update");
+            #[cfg(feature = "tracing")]
+            info!("Updating job status for end of current run");
             let now = Instant::now();
             let mut status = match status.lock() {
                 Ok(status) => status,
                 Err(_) => {
+                    #[cfg(feature = "tracing")]
                     warn!("Job exiting run loop due to poison error when locking status for end of job execution");
                     break;
                 }
@@ -418,6 +450,7 @@ fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<(bool, usize)>, Condv
     let mut guard = match shutdown.0.lock() {
         Ok(guard) => guard,
         Err(_) => {
+            #[cfg(feature = "tracing")]
             warn!("Sleep loop encountered poisoned shutdown mutex when acquiring initial shutdown signal lock, treating as shutdown signal");
             return SleepResult::Shutdown;
         }
@@ -425,16 +458,19 @@ fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<(bool, usize)>, Condv
     loop {
         let (is_shutdown, execute_requests) = *guard;
         if is_shutdown {
+            #[cfg(feature = "tracing")]
             info!("Sleep loop exiting early due to shutdown signal being true");
             return SleepResult::Shutdown;
         }
         if execute_requests > 0 {
+            #[cfg(feature = "tracing")]
             info!("Sleep loop exiting early due to the presence of {} execute requests, which have been reset to 0", execute_requests);
             guard.1 = 0;
             return SleepResult::ExecuteRequested;
         }
         let time_to_wait = Instant::now().saturating_duration_since(target_time);
         if time_to_wait.is_zero() {
+            #[cfg(feature = "tracing")]
             info!("Sleep loop finished waiting for time to pass");
             return SleepResult::SleepFinished;
         }
@@ -443,6 +479,7 @@ fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<(bool, usize)>, Condv
                 guard = g
             },
             Err(_) => {
+                #[cfg(feature = "tracing")]
                 warn!("Sleep loop saw poisoned shutdown mutex while sleeping, treating as shutdown signal");
                 return SleepResult::Shutdown;
             }
