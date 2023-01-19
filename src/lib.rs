@@ -1,4 +1,11 @@
-use std::{time::{Instant, Duration}, sync::{Arc, Mutex, Condvar, MutexGuard}, thread::JoinHandle, collections::HashMap};
+//! A simple [JobRunner] which gives each job a dedicated thread and allows for 
+//! configurable delays between each invocation of the job's logic.
+
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
+
+use std::{time::{Instant, Duration}, sync::{Arc, Mutex, Condvar}, thread::JoinHandle, collections::HashMap};
 
 use tracing::{info, warn, info_span, debug_span, debug};
 
@@ -8,25 +15,25 @@ use tracing::{info, warn, info_span, debug_span, debug};
 /// either fixed or varying delays.
 pub trait Schedule : Send + 'static {
     /// Returns when the next job execution should occur at.
-    fn next_start_time(&mut self, latest_start_time: Instant, latest_end_time: Instant) -> Instant;
+    fn next_start_time(&mut self) -> Instant;
 }
 
-impl<T> Schedule for T where T : FnMut(Instant, Instant) -> Instant + Send + 'static {
-    fn next_start_time(&mut self, latest_start_time: Instant, latest_end_time: Instant) -> Instant {
-        self(latest_start_time, latest_end_time)
+impl<T> Schedule for T where T : FnMut() -> Instant + Send + 'static {
+    fn next_start_time(&mut self) -> Instant {
+        self()
     }
 }
 
 /// Returns a [Schedule] which runs the job constantly, as fast as possible.
-pub fn always() -> impl Schedule {
-    |_, _| Instant::now()
+pub fn spin() -> impl Schedule {
+    || Instant::now()
 }
 
 /// Returns a [Schedule] which inserts a fixed delay between the end of one job
 /// execution and the start of the next. Note that this means that how often jobs
 /// execute depends on how long jobs take to run.
 pub fn fixed_delay(delay: Duration) -> impl Schedule {
-    move |_, _| Instant::now() + delay
+    move || Instant::now() + delay
 }
 
 /// Returns a [Schedule] which runs jobs on a cron schedule. If a job execution
@@ -38,7 +45,7 @@ pub fn fixed_delay(delay: Duration) -> impl Schedule {
 pub fn cron(schedule: &str) -> Result<impl Schedule, ::cron::error::Error> {
     use std::str::FromStr;
     let schedule = ::cron::Schedule::from_str(schedule)?;
-    Ok(move |_, _| {
+    Ok(move || {
         schedule.upcoming(chrono::Utc).next().and_then(|when| {
             let duration = when - chrono::Utc::now();
             Some(Instant::now() + duration.to_std().ok()?)
@@ -131,7 +138,7 @@ impl JobRunner {
     #[tracing::instrument(skip_all)]
     pub fn start(&mut self, job: Job) -> std::io::Result<()> {
         let status = Arc::new(Mutex::new(JobStatus::default()));
-        let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
+        let shutdown = Arc::new((Mutex::new((false, 0)), Condvar::new()));
         let thread_builder = match job.thread_builder {
             Some(thread_builder) => thread_builder(),
             None => std::thread::Builder::new()
@@ -151,7 +158,7 @@ impl JobRunner {
             join_handle,
         });
         if let Some(handle) = prev_handle {
-            *handle.shutdown.0.lock().unwrap() = true;
+            handle.shutdown.0.lock().unwrap().0 = true;
             let _ = handle.join_handle.join();
         }
         Ok(())
@@ -169,10 +176,10 @@ impl JobRunner {
         info!("Signaling {} jobs to stop", self.jobs.len());
         for (name, handle) in &mut self.jobs {
             let _span = info_span!("stop_job", job = name);
-            if let Ok(mut shutdown) = handle.shutdown.0.lock() {
-                if !*shutdown {
+            if let Ok(mut guard) = handle.shutdown.0.lock() {
+                if !guard.0 {
                     info!("Signaled job to shut down");
-                    *shutdown = true;
+                    guard.0 = true;
                 }
             } else {
                 warn!("Received poison error when trying to acquire shutdown signal lock");
@@ -219,7 +226,7 @@ impl Drop for JobRunner {
 
 struct JobHandle {
     status: Arc<Mutex<JobStatus>>,
-    shutdown: Arc<(Mutex<bool>, Condvar)>,
+    shutdown: Arc<(Mutex<(bool, usize)>, Condvar)>,
     join_handle: JoinHandle<()>,
 }
 
@@ -247,19 +254,17 @@ pub struct JobStatus {
 }
 
 fn run_job(
-    name: String,
-    mut schedule: Box<dyn Schedule>,
-    mut logic: Box<dyn FnMut()>,
-    status: Arc<Mutex<JobStatus>>,
-    shutdown: Arc<(Mutex<bool>, Condvar)>) {
+        name: String,
+        mut schedule: Box<dyn Schedule>,
+        mut logic: Box<dyn FnMut()>,
+        status: Arc<Mutex<JobStatus>>,
+        shutdown: Arc<(Mutex<(bool, usize)>, Condvar)>) {
     let _fn_span = tracing::info_span!("run_job", job = name);
-    let mut latest_start_time = Instant::now();
-    let mut latest_end_time = latest_start_time;
     loop {
         let next_start_time = {
             let _span = debug_span!("job_schedule");
             info!("Invoking job schedule");
-            schedule.next_start_time(latest_start_time, latest_end_time)
+            schedule.next_start_time()
         };
 
         // Update the JobStatus for the next start time.
@@ -286,7 +291,7 @@ fn run_job(
         }
         
         // Update the JobStatus for the start of the current run.
-        latest_start_time = {
+        let latest_start_time = {
             let _span = debug_span!("job_start_status_update");
             debug!("Updating job status for start of current run");
             let now = Instant::now();
@@ -312,7 +317,7 @@ fn run_job(
         }
 
         // Update the JobStatus for the end of the current run.
-        latest_end_time = {
+        {
             let _span = debug_span!("job_end_status_update");
             debug!("Updating job status for end of current run");
             let now = Instant::now();
@@ -327,13 +332,12 @@ fn run_job(
             status.current_start_time = None;
             status.latest_start_time = Some(latest_start_time);
             status.latest_end_time = Some(now);
-            now
         };
     }
 }
 
-fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<bool>, Condvar)>) -> bool {
-    let mut guard: MutexGuard<bool> = match shutdown.0.lock() {
+fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<(bool, usize)>, Condvar)>) -> bool {
+    let mut guard = match shutdown.0.lock() {
         Ok(guard) => guard,
         Err(_) => {
             warn!("Sleep loop encountered poisoned shutdown mutex when acquiring initial shutdown signal lock, treating as shutdown signal");
@@ -341,8 +345,9 @@ fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<bool>, Condvar)>) -> 
         }
     };
     loop {
-        if *guard {
-            info!("Sleep loop exiting due to shutdown signal being true");
+        let (is_shutdown, execute_requests) = *guard;
+        if is_shutdown || execute_requests > 0 {
+            info!("Sleep loop exiting due to shutdown signal being true or execute requests present");
             return true;
         }
         let time_to_wait = Instant::now().saturating_duration_since(target_time);
