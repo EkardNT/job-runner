@@ -1,3 +1,7 @@
+[![Crate](https://img.shields.io/crates/v/job-runner.svg?style=for-the-badge)](https://crates.io/crates/job-runner)
+
+[![Documentation](https://img.shields.io/docsrs/job-runner?style=for-the-badge)](https://docs.rs/symphonia/latest/job-runner/)
+
 A simple job runner library which gives each job a dedicated thread and allows for 
 configurable delays between each invocation of the job's logic.
 
