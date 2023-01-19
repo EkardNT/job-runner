@@ -49,6 +49,10 @@ pub trait Schedule : Send + 'static {
     /// Returns when the next job execution should occur at. Typical implementations of this
     /// method will choose the next delay by looking at the current time using mechanisms such
     /// as [Instant::now()](std::time::Instant::now).
+    /// 
+    /// The actual delay that takes place is bounded by your OS' standard timing precision. This
+    /// library does not attempt to use spin loops or any other strategies to get extremely precise
+    /// timings - the delay is ultimately implemented using [Condvar::wait_timeout](std::sync::Condvar::wait_timeout).
     fn next_start_delay(&mut self) -> Duration;
 }
 
@@ -163,6 +167,41 @@ impl JobRunner {
             };
             Some((name, status.clone()))
         })
+    }
+
+    /// Request that a specific job execute immediately. How soon the job executes
+    /// depends on whether it is currently executing, or whether it is sleeping waiting
+    /// for its next regular execution. If the job is currently executing, then once the
+    /// current execution ends, the job will immediately begin executing again rather
+    /// than sleeping. If the job is currently sleeping, then the sleep will be interrupted
+    /// and the job will begin executing on its dedicated thread.
+    ///
+    /// No matter how many times method is called before the job thread is actually able to
+    /// start the next execution, the job will only execute once for all those requests. This
+    /// can happen if for example a long-running job is executing and `request_execution` is
+    /// called multiple times before the currently-executing run finishes. In that case, the
+    /// job will immediately begin executing after the current run finishes, but after that
+    /// follow up run finishes then the job will go back to its normal schedule (assuming no
+    /// other `request_execution` calls have arrived in the mean time).
+    pub fn request_execution(&self, job_name: &str) {
+        let handle = match self.jobs.get(job_name) {
+            Some(h) => h,
+            None => {
+                info!("No job named {} is currently registered", job_name);
+                return;
+            }
+        };
+        {
+            let mut guard = match handle.shutdown.0.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    warn!("Unable to request execution of job {} because poisoned shutdown mutex lock encountered", job_name);
+                    return;
+                }
+            };
+            guard.1 = guard.1.saturating_add(1);
+        }
+        handle.shutdown.1.notify_one();
     }
 
     /// Registers a job and starts it executing on a dedicated thread. The job schedule's
@@ -314,12 +353,12 @@ fn run_job(
             status.next_start_time = Some(next_start_time);
         };
         
-        let is_shutdown = {
+        let sleep_result = {
             let _span = debug_span!("job_sleep");
             sleep_until(next_start_time, &shutdown)
         };
-        if is_shutdown {
-            info!("Job exiting run loop due to shutdown signal");
+        if sleep_result.should_exit_job() {
+            info!("Job run loop will exit due to sleep result {:?}", sleep_result);
             break;
         }
         
@@ -369,24 +408,29 @@ fn run_job(
     }
 }
 
-fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<(bool, usize)>, Condvar)>) -> bool {
+fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<(bool, usize)>, Condvar)>) -> SleepResult {
     let mut guard = match shutdown.0.lock() {
         Ok(guard) => guard,
         Err(_) => {
             warn!("Sleep loop encountered poisoned shutdown mutex when acquiring initial shutdown signal lock, treating as shutdown signal");
-            return true;
+            return SleepResult::Shutdown;
         }
     };
     loop {
         let (is_shutdown, execute_requests) = *guard;
-        if is_shutdown || execute_requests > 0 {
-            info!("Sleep loop exiting due to shutdown signal being true or execute requests present");
-            return true;
+        if is_shutdown {
+            info!("Sleep loop exiting early due to shutdown signal being true");
+            return SleepResult::Shutdown;
+        }
+        if execute_requests > 0 {
+            info!("Sleep loop exiting early due to the presence of {} execute requests, which have been reset to 0", execute_requests);
+            guard.1 = 0;
+            return SleepResult::ExecuteRequested;
         }
         let time_to_wait = Instant::now().saturating_duration_since(target_time);
         if time_to_wait.is_zero() {
             info!("Sleep loop finished waiting for time to pass");
-            return false;
+            return SleepResult::SleepFinished;
         }
         match shutdown.1.wait_timeout(guard, time_to_wait) {
             Ok((g, _)) => {
@@ -394,8 +438,25 @@ fn sleep_until(target_time: Instant, shutdown: &Arc<(Mutex<(bool, usize)>, Condv
             },
             Err(_) => {
                 warn!("Sleep loop saw poisoned shutdown mutex while sleeping, treating as shutdown signal");
-                return true;
+                return SleepResult::Shutdown;
             }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SleepResult {
+    Shutdown,
+    ExecuteRequested,
+    SleepFinished,
+}
+
+impl SleepResult {
+    fn should_exit_job(&self) -> bool {
+        match self {
+            SleepResult::Shutdown => true,
+            SleepResult::ExecuteRequested
+            | SleepResult::SleepFinished => false,
         }
     }
 }
