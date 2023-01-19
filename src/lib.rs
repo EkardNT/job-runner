@@ -131,6 +131,12 @@ pub struct JobRunner {
     jobs: HashMap<String, JobHandle>,
 }
 
+impl Default for JobRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JobRunner {
     /// Initialize a new [JobRunner] with no jobs started yet.
     pub fn new() -> Self {
